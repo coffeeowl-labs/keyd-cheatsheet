@@ -2445,7 +2445,7 @@ expression: project(&sheet)
   is_base: false
   accent: "#9aa0a6"
   how: "toggle: ⇧ + ⇧"
-  hint: passthrough — these revert to plain keys (gaming)
+  hint: passthrough — bright keys revert to plain; dim keys still inherit Base
   caps:
     - phys: "0"
       key: "0"

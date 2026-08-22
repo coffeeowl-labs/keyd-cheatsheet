@@ -376,6 +376,28 @@ fn apply_label(cap: &mut KeyCap, labels: &[(String, String)], key: &str) {
     }
 }
 
+/// Style `cap` as *inherited from `[main]`*, returning whether main bound it at all
+/// (`false` = genuinely a plain key). A layer occludes main key-by-key rather than
+/// replacing it, so a slot the layer doesn't bind still resolves to main's binding --
+/// `noop` lockouts included. Drawing such a slot as a working plain cap silently
+/// contradicts keyd: the cap promises a live key while the daemon emits nothing (or
+/// fires main's macro). That is exactly how a dead `backspace` under `[game]` stayed
+/// invisible on the board. Receded, not emphasized: it reads as inherited rather than
+/// as one of this layer's own remaps.
+fn style_inherited(cap: &mut KeyCap, cfg: &Config, key: &str) -> bool {
+    let Some(val) = cfg.remap(key) else { return false };
+    if is_noop(val) {
+        style_noop(cap);
+    } else {
+        cap.label = prettify(val);
+        cap.ghost = base_legend(key);
+        cap.state = KeyState::Dim;
+        // Main's target is what keyd emits here, so glow on that, not the physical key.
+        cap.key = output_chord(val).unwrap_or_default();
+    }
+    true
+}
+
 fn build_base(cfg: &Config, geom: &Geometry) -> Board {
     let mut keys = Vec::new();
     for slot in &geom.slots {
@@ -488,7 +510,10 @@ fn build_layer(cfg: &Config, layer: &Layer, geom: &Geometry) -> Board {
             }
             None => "toggle layer".to_string(),
         };
-        (how, "passthrough \u{2014} these revert to plain keys (gaming)".to_string())
+        // Only the keys [game] actually names revert to plain -- everything else still
+        // falls through to [main]. The old wording promised passthrough board-wide,
+        // which is what hid main's `noop` lockout on keys [game] forgot to restore.
+        (how, "passthrough \u{2014} bright keys revert to plain; dim keys still inherit Base".to_string())
     } else {
         let how = match &act_key {
             Some(k) => format!("hold {}", base_legend(k)),
@@ -506,6 +531,7 @@ fn build_layer(cfg: &Config, layer: &Layer, geom: &Geometry) -> Board {
             continue;
         };
         let mut cap = cap_at(slot, nm);
+        let mut inherited = false;
         if let Some(val) = layer.get(nm) {
             if is_noop(val) {
                 style_noop(&mut cap);
@@ -528,8 +554,11 @@ fn build_layer(cfg: &Config, layer: &Layer, geom: &Geometry) -> Board {
             // Held to reach this layer — keyd emits nothing for it, so never glow it.
             cap.key = String::new();
         } else {
-            cap.label = base_legend(nm);
-            cap.state = KeyState::Dim;
+            inherited = style_inherited(&mut cap, cfg, nm);
+            if !inherited {
+                cap.label = base_legend(nm);
+                cap.state = KeyState::Dim;
+            }
         }
         // A chord declared in this layer (`j+k = esc` under `[nav]`): badge each member
         // so it's visible on the layer's own board, just like a base combo.
@@ -539,7 +568,10 @@ fn build_layer(cfg: &Config, layer: &Layer, geom: &Geometry) -> Board {
                 color: accent.clone(),
             });
         }
-        apply_label(&mut cap, &layer.labels, nm);
+        // An inherited cap shows main's binding, so it takes main's custom label too:
+        // `# keyd-viz: esc = kwrite` should read "kwrite" on every board that inherits
+        // it, not only on the base.
+        apply_label(&mut cap, if inherited { &cfg.labels } else { &layer.labels }, nm);
         keys.push(cap);
     }
 
@@ -592,6 +624,7 @@ fn build_composite(cfg: &Config, layer: &Layer, geom: &Geometry) -> Board {
             continue;
         };
         let mut cap = cap_at(slot, nm);
+        let mut inherited = false;
         // The effective binding for this key when the whole stack is held, with the
         // accent of the layer it came from: the composite's own override first, else
         // the last constituent (name order) that binds it.
@@ -620,14 +653,20 @@ fn build_composite(cfg: &Config, layer: &Layer, geom: &Geometry) -> Board {
             cap.badge_left = Some(Badge { text: "HOLD".to_string(), color: accent.clone() });
             cap.key = String::new();
         } else {
-            cap.label = base_legend(nm);
-            cap.state = KeyState::Dim;
+            inherited = style_inherited(&mut cap, cfg, nm);
+            if !inherited {
+                cap.label = base_legend(nm);
+                cap.state = KeyState::Dim;
+            }
         }
         // The composite's own chords (`j+k = …` under `[nav+sym]`) badge their members.
         if in_layer_combo(layer, nm) {
             cap.badge_right = Some(Badge { text: "\u{2295}".to_string(), color: own_accent.clone() });
         }
-        apply_label(&mut cap, &layer.labels, nm);
+        // An inherited cap shows main's binding, so it takes main's custom label too:
+        // `# keyd-viz: esc = kwrite` should read "kwrite" on every board that inherits
+        // it, not only on the base.
+        apply_label(&mut cap, if inherited { &cfg.labels } else { &layer.labels }, nm);
         keys.push(cap);
     }
 
@@ -673,6 +712,64 @@ mod tests {
         assert_eq!(cap_named(&board, "h").key, "leftshift+9", "h = ( glows Shift+9");
         assert_eq!(cap_named(&board, "j").key, "leftshift+0", "j = ) glows Shift+0");
         assert_eq!(cap_named(&board, "k").key, "leftshift+8", "k = * glows Shift+8");
+    }
+
+    #[test]
+    fn layer_inherits_main_noop_instead_of_faking_a_plain_key() {
+        // Regression: a layer occludes [main] key-by-key, so a key the layer doesn't
+        // bind still resolves to main's binding. The layer board used to draw every
+        // such slot as a working plain cap, which hid a `[main]` noop lockout -- a
+        // dead `backspace` under `[game]` looked live on the board.
+        let geom = Geometry::from_rows(&[&[("f", 1.0), ("g", 1.0), ("backspace", 1.0)]]);
+        let cfg = crate::parser::parse_text(
+            "[ids]\n*\n\n[main]\nbackspace = noop\ng = b\n\n[game]\nf = f\n",
+        );
+        let board = build_layer(&cfg, cfg.layer("game").unwrap(), &geom);
+
+        let bs = cap_named(&board, "backspace");
+        assert_eq!(bs.label, "", "an inherited noop shows no legend");
+        assert_eq!(bs.state, KeyState::Dim, "an inherited noop is dimmed");
+        assert_eq!(bs.key, "", "an inherited noop never glows");
+
+        // The other side of the same rule: a key main *remaps* shows main's target,
+        // receded -- it is inherited, not one of this layer's own bindings.
+        let g = cap_named(&board, "g");
+        assert_eq!(g.label, "B", "shows what main actually emits");
+        assert_eq!(g.state, KeyState::Dim, "inherited, so it stays receded");
+        assert!(!g.emphasized, "an inherited key must not read as the layer's own remap");
+
+        // And a key main leaves alone is still a genuinely plain passthrough cap.
+        let f = cap_named(&board, "f");
+        assert_eq!(f.label, "F");
+        assert!(f.emphasized, "the layer's own binding still reads as its own");
+    }
+
+    #[test]
+    fn composite_inherits_main_noop_too() {
+        // build_composite had the same fallthrough bug as build_layer.
+        let geom = Geometry::from_rows(&[&[("h", 1.0), ("q", 1.0), ("backspace", 1.0)]]);
+        let cfg = crate::parser::parse_text(
+            "[ids]\n*\n\n[main]\nbackspace = noop\nf = layer(nav)\ns = layer(sym)\n\
+             \n[nav]\nh = left\n\n[sym]\nq = S-1\n\n[nav+sym]\nh = end\n",
+        );
+        let board = build_composite(&cfg, cfg.layer("nav+sym").unwrap(), &geom);
+        let bs = cap_named(&board, "backspace");
+        assert_eq!(bs.label, "", "composite must inherit main's noop as dead, not plain");
+        assert_eq!(bs.state, KeyState::Dim);
+        assert_eq!(bs.key, "");
+    }
+
+    #[test]
+    fn inherited_key_takes_mains_custom_label() {
+        // An inherited cap shows main's binding, so it must show main's label as well.
+        let geom = Geometry::from_rows(&[&[("f", 1.0), ("g", 1.0)]]);
+        let cfg = crate::parser::parse_text(
+            "[ids]\n*\n\n[main]\n# keyd-viz: g = kwrite\ng = b\n\n[game]\nf = f\n",
+        );
+        let board = build_layer(&cfg, cfg.layer("game").unwrap(), &geom);
+        let g = cap_named(&board, "g");
+        assert_eq!(g.label, "kwrite", "main's label follows its binding onto layer boards");
+        assert_eq!(g.ghost, "B", "the inherited target demotes to the ghost line");
     }
 
     #[test]
